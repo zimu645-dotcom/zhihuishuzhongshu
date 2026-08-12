@@ -1,0 +1,20 @@
+# Python dependencies for ZhihuiZhongshu
+PyQt6==6.7.0
+SQLAlchemy==2.0.30
+PyMuPDF==1.24.9
+python-docx==1.1.2
+openpyxl==3.1.2
+python-pptx==0.6.23
+markdown==3.6
+pillow==10.3.0
+pytesseract==0.3.10
+requests==2.32.3
+openai>=1.30.0
+httpx>=0.28
+pandas==2.2.2
+numpy==1.26.4
+matplotlib==3.8.4
+python-dotenv==1.0.1
+loguru==0.7.2
+pyyaml==6.0.1
+ddgs

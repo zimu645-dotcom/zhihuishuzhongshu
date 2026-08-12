@@ -1,0 +1,22 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── IDE ──
+.idea/
+.vscode/
+
+# ── 用户数据（数据库、上传文件、日志、导出文件、静态缓存）──
+# data/ 目录是运行时生成的数据，包含用户上传文件和本地数据库，不入库
+data/
+
+# ── 系统 ──
+.DS_Store
+Thumbs.db
+
+# ── 打包产物 ──
+build/
+dist/
+*.spec
