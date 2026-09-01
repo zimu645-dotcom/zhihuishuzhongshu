@@ -169,13 +169,17 @@ class RecyclePanel(QWidget):
             )
             if reply == QMessageBox.StandardButton.Yes:
                 with self.db.session() as s:
-                    from app.database import RecycleBin, KnowledgeBase, File
+                    from app.database import RecycleBin, KnowledgeBase, File, FileChunk
                     expired = s.query(RecycleBin).all()
                     for rb in expired:
                         if rb.item_type == "knowledge_base":
                             s.query(KnowledgeBase).filter(
                                 KnowledgeBase.id == rb.item_id).delete()
                         elif rb.item_type == "file":
+                            # 连同分块记录一起清理，不留死数据
+                            s.query(FileChunk).filter(
+                                FileChunk.file_id == rb.item_id
+                            ).delete(synchronize_session=False)
                             s.query(File).filter(
                                 File.id == rb.item_id).delete()
                         s.delete(rb)

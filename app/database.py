@@ -12,7 +12,7 @@ from typing import Optional
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, DateTime,
-    Float, Boolean, ForeignKey, JSON, Index, func
+    Float, Boolean, ForeignKey, JSON, Index, func, event
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -90,6 +90,9 @@ class File(Base):
     def set_tags(self, tags: list):
         self.tags = json.dumps(tags, ensure_ascii=False)
 
+    # 同 Conversation：防止回收站彻底清理后新文件复用旧 id
+    __table_args__ = {"sqlite_autoincrement": True}
+
 
 class FileChunk(Base):
     """文件分块"""
@@ -129,6 +132,10 @@ class Conversation(Base):
     messages = relationship("Message", back_populates="conversation",
                             cascade="all, delete-orphan",
                             order_by="Message.created_at")
+
+    # sqlite_autoincrement：禁止删除后复用行 id（否则新会话会"继承"旧会话的 id，
+    # 连带查出旧会话遗留的消息）
+    __table_args__ = {"sqlite_autoincrement": True}
 
 
 class Message(Base):
@@ -259,10 +266,36 @@ class DatabaseManager:
         self.engine = create_engine(f"sqlite:///{db_path}?check_same_thread=False",
                                     echo=False)
         self.SessionLocal = sessionmaker(bind=self.engine, expire_on_commit=False)
+        # SQLite 默认 journal 模式下写操作锁全库，多会话并发写（后台AI线程+主线程）
+        # 会互相阻塞甚至报 database is locked。开启 WAL + busy_timeout 解决。
+        @event.listens_for(self.engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, conn_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
 
     def initialize(self):
         """初始化数据库，创建表"""
         Base.metadata.create_all(self.engine)
+        self._cleanup_orphans()
+
+    def _cleanup_orphans(self):
+        """清理孤儿数据（历史 bug 遗留）：
+        1. 消息指向已不存在的会话（删除会话时未级联删消息，SQLite 复用会话 id
+           后新会话会"继承"这些旧消息，表现为删除会话后新建会话出现历史对话）
+        2. 文件分块指向已不存在的文件
+        """
+        try:
+            with self.session() as s:
+                s.query(Message).filter(
+                    ~Message.conversation_id.in_(s.query(Conversation.id))
+                ).delete(synchronize_session=False)
+                s.query(FileChunk).filter(
+                    ~FileChunk.file_id.in_(s.query(File.id))
+                ).delete(synchronize_session=False)
+        except Exception:
+            pass
 
     @contextmanager
     def session(self):
@@ -278,6 +311,54 @@ class DatabaseManager:
             session.close()
 
     # ─── 知识库操作 ───
+
+    def _abs_storage_path(self, storage_path: str) -> str:
+        """把 storage_path 规范为绝对路径（相对路径基于项目根目录）"""
+        if not storage_path:
+            return ""
+        if os.path.isabs(storage_path):
+            return storage_path
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", storage_path))
+
+    def _remove_file_from_disk(self, storage_path: str):
+        """按记录的真实路径删除磁盘文件"""
+        p = self._abs_storage_path(storage_path)
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+    def _cleanup_kb_upload_dirs(self, kb_names: set):
+        """删除 uploads 下该知识库对应的目录。
+        优先按名字匹配（原名 + 上传时用的安全名），再自底向上清理空目录。"""
+        try:
+            import shutil
+            upload_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "data", "uploads"))
+            if not os.path.exists(upload_dir):
+                return
+            for name in kb_names:
+                if not name:
+                    continue
+                safe_name = "".join(c for c in name if c.isalnum() or c in " _-")
+                for d in {os.path.join(upload_dir, name),
+                          os.path.join(upload_dir, safe_name)}:
+                    if os.path.isdir(d):
+                        try:
+                            shutil.rmtree(d)
+                        except Exception:
+                            pass
+            # 自底向上清理残留的空目录（文件已按记录删干净后，文件夹级目录变空）
+            for root, dirs, _files in os.walk(upload_dir, topdown=False):
+                for d in dirs:
+                    dp = os.path.join(root, d)
+                    try:
+                        os.rmdir(dp)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
 
     def create_knowledge_base(self, name: str, description: str = "") -> KnowledgeBase:
         with self.session() as s:
@@ -300,19 +381,22 @@ class DatabaseManager:
             return s.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id).first()
 
     def delete_knowledge_base(self, kb_id: int):
+        """删除知识库：软删除 DB 记录（进回收站），并按每个文件的 storage_path
+        逐个删除磁盘文件，最后清理 uploads 下对应目录，保证库与文件夹同步"""
+        storage_paths = []
+        kb_names = set()
         with self.session() as s:
             kb = s.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id).first()
-            if kb:
-                kb_name = kb.name
-                kb.is_deleted = True
-                kb.deleted_at = datetime.now()
+            if not kb:
+                return
+            kb_names.add(kb.name)
 
-                # 级联软删除所有文件夹和文件
-                folders = s.query(Folder).filter(
-                    Folder.knowledge_base_id == kb_id,
-                    Folder.is_deleted == False
-                ).all()
-                for folder in folders:
+            # 级联软删除所有层级的文件夹和文件
+            folders = s.query(Folder).filter(
+                Folder.knowledge_base_id == kb_id
+            ).all()
+            for folder in folders:
+                if not folder.is_deleted:
                     folder.is_deleted = True
                     folder.deleted_at = datetime.now()
                     s.add(RecycleBin(
@@ -320,11 +404,12 @@ class DatabaseManager:
                         item_name=folder.name,
                         expires_at=datetime.now() + timedelta(days=30)
                     ))
-                    files = s.query(File).filter(
-                        File.folder_id == folder.id,
-                        File.is_deleted == False
-                    ).all()
-                    for f in files:
+                # 收集该文件夹下全部文件的物理路径（含历史已软删的，磁盘一并清理）
+                files = s.query(File).filter(File.folder_id == folder.id).all()
+                for f in files:
+                    if f.storage_path:
+                        storage_paths.append(f.storage_path)
+                    if not f.is_deleted:
                         f.is_deleted = True
                         f.deleted_at = datetime.now()
                         s.add(RecycleBin(
@@ -333,25 +418,20 @@ class DatabaseManager:
                             expires_at=datetime.now() + timedelta(days=30)
                         ))
 
-                # 添加到回收站
-                rb = RecycleBin(
-                    item_type="knowledge_base",
-                    item_id=kb.id,
-                    item_name=kb.name,
-                    expires_at=datetime.now() + timedelta(days=30)
-                )
-                s.add(rb)
+            # 添加到回收站
+            s.add(RecycleBin(
+                item_type="knowledge_base",
+                item_id=kb.id,
+                item_name=kb.name,
+                expires_at=datetime.now() + timedelta(days=30)
+            ))
+            kb.is_deleted = True
+            kb.deleted_at = datetime.now()
 
-        # 删除 uploads 中对应的目录（不管 storage_path 是什么）
-        try:
-            safe_name = "".join(c for c in kb_name if c.isalnum() or c in " _-")
-            upload_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "uploads"))
-            kb_upload_dir = os.path.join(upload_dir, safe_name)
-            if os.path.exists(kb_upload_dir):
-                import shutil
-                shutil.rmtree(kb_upload_dir)
-        except Exception:
-            pass
+        # 事务提交后再删物理文件，避免事务回滚但文件已删
+        for p in storage_paths:
+            self._remove_file_from_disk(p)
+        self._cleanup_kb_upload_dirs(kb_names)
 
     # ─── 文件夹操作 ───
 
@@ -439,65 +519,67 @@ class DatabaseManager:
                     file.chunk_count = chunk_count
 
     def delete_file(self, file_id: int):
+        storage_path = ""
         with self.session() as s:
             file = s.query(File).filter(File.id == file_id).first()
             if file:
-                storage_path = file.storage_path
+                storage_path = file.storage_path or ""
                 file.is_deleted = True
                 file.deleted_at = datetime.now()
-                rb = RecycleBin(
+                s.add(RecycleBin(
                     item_type="file",
                     item_id=file.id,
                     item_name=file.original_name,
                     expires_at=datetime.now() + timedelta(days=30)
-                )
-                s.add(rb)
-        # 删除物理文件
+                ))
+        # 事务提交后再删除物理文件，保证库与磁盘同步
         if storage_path:
-            if not os.path.isabs(storage_path):
-                storage_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", storage_path))
-            if os.path.exists(storage_path):
-                try:
-                    os.remove(storage_path)
-                except Exception:
-                    pass
+            self._remove_file_from_disk(storage_path)
 
     def delete_folder(self, folder_id: int):
+        """删除文件夹：递归软删除所有子文件夹及文件，并同步删除物理文件"""
+        storage_paths = []
         with self.session() as s:
             folder = s.query(Folder).filter(Folder.id == folder_id).first()
-            if folder:
-                # 软删除文件夹下的所有文件
-                files = s.query(File).filter(
-                    File.folder_id == folder_id,
-                    File.is_deleted == False
-                ).all()
-                for f in files:
-                    f.is_deleted = True
-                    f.deleted_at = datetime.now()
-                    # 同步删除物理文件
-                    fp_del = f.storage_path
-                    if fp_del:
-                        if not os.path.isabs(fp_del):
-                            fp_del = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", fp_del))
-                        if os.path.exists(fp_del):
-                            try:
-                                os.remove(fp_del)
-                            except Exception:
-                                pass
+            if not folder:
+                return
+            # 递归收集所有后代文件夹 id（不限层级，避免子文件夹残留导致
+            # 其文件仍被选中发给 AI）
+            all_folder_ids = []
+            stack = [folder_id]
+            while stack:
+                fid = stack.pop()
+                if fid in all_folder_ids:
+                    continue
+                all_folder_ids.append(fid)
+                children = s.query(Folder.id).filter(Folder.parent_id == fid).all()
+                stack.extend(cid for (cid,) in children)
+            for fid in all_folder_ids:
+                f_obj = s.query(Folder).filter(Folder.id == fid).first()
+                if f_obj and not f_obj.is_deleted:
+                    f_obj.is_deleted = True
+                    f_obj.deleted_at = datetime.now()
                     s.add(RecycleBin(
-                        item_type="file", item_id=f.id,
-                        item_name=f.original_name,
+                        item_type="folder", item_id=f_obj.id,
+                        item_name=f_obj.name,
                         expires_at=datetime.now() + timedelta(days=30)
                     ))
-                folder.is_deleted = True
-                folder.deleted_at = datetime.now()
-                rb = RecycleBin(
-                    item_type="folder",
-                    item_id=folder.id,
-                    item_name=folder.name,
-                    expires_at=datetime.now() + timedelta(days=30)
-                )
-                s.add(rb)
+                files = s.query(File).filter(File.folder_id == fid).all()
+                for f in files:
+                    if f.storage_path:
+                        storage_paths.append(f.storage_path)
+                    if not f.is_deleted:
+                        f.is_deleted = True
+                        f.deleted_at = datetime.now()
+                        s.add(RecycleBin(
+                            item_type="file", item_id=f.id,
+                            item_name=f.original_name,
+                            expires_at=datetime.now() + timedelta(days=30)
+                        ))
+        # 事务提交后统一删除物理文件
+        for p in storage_paths:
+            self._remove_file_from_disk(p)
+        self._cleanup_kb_upload_dirs(set())
 
     # ─── 文件分块操作 ───
 
@@ -540,6 +622,21 @@ class DatabaseManager:
         with self.session() as s:
             return s.query(Conversation).filter(Conversation.id == conv_id).first()
 
+    def delete_conversation(self, conv_id: int) -> bool:
+        """彻底删除会话：必须连同其全部消息一起删除。
+        注意不能用 bulk delete 直接删 conversations 行——ORM 的级联删除只对
+        session.delete(obj) 生效；而且 SQLite 删除最大 id 行后新行会复用该 id，
+        遗留的消息会被新会话"继承"（表现为新建会话出现历史对话记录）。"""
+        with self.session() as s:
+            conv = s.query(Conversation).filter(Conversation.id == conv_id).first()
+            if not conv:
+                return False
+            s.query(Message).filter(
+                Message.conversation_id == conv_id
+            ).delete(synchronize_session=False)
+            s.delete(conv)
+            return True
+
     def add_message(self, conv_id: int, role: str, content: str,
                     content_type: str = "text", metadata: dict = None,
                     token_count: int = 0) -> Message:
@@ -562,10 +659,13 @@ class DatabaseManager:
             return msg
 
     def get_messages(self, conv_id: int, limit: int = 100):
+        """取最近 limit 条消息（按时间正序返回）。
+        原实现直接正序 limit，多轮对话后发给 AI 的永远是最早的消息。"""
         with self.session() as s:
-            return s.query(Message).filter(
+            msgs = s.query(Message).filter(
                 Message.conversation_id == conv_id
-            ).order_by(Message.created_at).limit(limit).all()
+            ).order_by(Message.created_at.desc(), Message.id.desc()).limit(limit).all()
+            return list(reversed(msgs))
 
     def set_message_feedback(self, msg_id: int, feedback: int, reason: str = None):
         with self.session() as s:
@@ -688,7 +788,8 @@ class DatabaseManager:
             s.delete(rb)
 
     def clean_expired_items(self):
-        """清理过期回收站项目"""
+        """清理过期回收站项目（连带物理文件和分块记录，不留死数据）"""
+        file_paths = []
         with self.session() as s:
             now = datetime.now()
             expired = s.query(RecycleBin).filter(RecycleBin.expires_at <= now).all()
@@ -698,12 +799,20 @@ class DatabaseManager:
                         KnowledgeBase.id == rb.item_id
                     ).delete()
                 elif rb.item_type == "file":
+                    f = s.query(File).filter(File.id == rb.item_id).first()
+                    if f and f.storage_path:
+                        file_paths.append(f.storage_path)
+                    s.query(FileChunk).filter(
+                        FileChunk.file_id == rb.item_id
+                    ).delete(synchronize_session=False)
                     s.query(File).filter(File.id == rb.item_id).delete()
                 elif rb.item_type == "analysis":
                     s.query(AnalysisRecord).filter(
                         AnalysisRecord.id == rb.item_id
                     ).delete()
                 s.delete(rb)
+        for p in file_paths:
+            self._remove_file_from_disk(p)
 
     # ─── 日志操作 ───
 

@@ -413,9 +413,13 @@ class ChatPanel(QWidget):
     def _on_delete_conv_id(self, conv_id):
         reply = QMessageBox.question(self, "确认", "删除此会话？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
-            with self.db.session() as s:
-                from app.database import Conversation
-                s.query(Conversation).filter(Conversation.id == conv_id).delete()
+            # 先清掉该会话的响应状态：正在后台生成的回复不再落库，
+            # 否则会向已删除的会话插入消息，留下被下个同 id 会话"继承"的孤儿记录
+            self._responding_convs.pop(conv_id, None)
+            self._conv_state.pop(conv_id, None)
+            self._response_done.pop(conv_id, None)
+            # 级联删除会话及其全部消息（不能只删会话行）
+            self.db.delete_conversation(conv_id)
             if self.current_conversation and self.current_conversation.id == conv_id:
                 self.current_conversation = None
             self._load_conversations()
@@ -551,12 +555,22 @@ class ChatPanel(QWidget):
             self.empty_label.hide()
             for m in msgs:
                 self._add_message_bubble(m.role, m.content, m.content_type, m.feedback, m.id, m.msg_metadata)
-        # 如果该会话正在响应中，显示思考中
+        # 如果该会话正在响应中，重建流式气泡并接上已有进度
+        # （原实现只加一个静态"思考中"标签且不更新 _conv_state，导致切回会话后
+        #  流式输出不再刷新，看起来像卡死）
         if cid in self._responding_convs:
-            tl = QLabel("🤔 AI 正在分析...")
-            tl.setStyleSheet("color: #888; font-size: 13px; padding: 12px;")
+            st = self._conv_state.get(cid, {})
+            tl = QLabel()
             tl.setObjectName("thinking_label")
+            tl.setStyleSheet("color: #888; font-size: 13px; padding: 12px;")
+            existing = st.get("stream_text", "")
+            if existing:
+                tl.setTextFormat(Qt.TextFormat.RichText)
+                tl.setText(_md_to_html(existing))
+            else:
+                tl.setText("🤔 AI 正在分析...")
             self.messages_layout.addWidget(tl)
+            st["label"] = tl  # 轮询会刷新这个新气泡，流式输出无缝接上
         QTimer.singleShot(50, self._scroll_to_bottom)
 
     def _clear_messages(self):
@@ -720,13 +734,15 @@ class ChatPanel(QWidget):
             import traceback
             tb = traceback.format_exc()
             self.db.add_log("CRITICAL", "chat", "crash", f"发送崩溃: {str(e)}", {"trace": tb[:300]})
-            if self.current_conversation:
-                self._responding_convs.pop(self.current_conversation.id, None)
-            self.send_btn.setEnabled(True)
-            self.send_btn.setText("🚀 发送")
-            if self.current_conversation:
+            # 用实际出错的会话（发送时捕获的），避免误清别的会话状态
+            cid = self.current_conversation.id if self.current_conversation else None
+            if cid:
+                self._responding_convs.pop(cid, None)
+                self._conv_state.pop(cid, None)
+            self._update_send_btn()
+            if cid:
                 self._add_message_bubble("assistant", f"⚠️ 程序出错: {str(e)[:200]}")
-                self.db.add_message(self.current_conversation.id, "assistant", f"⚠️ 程序出错: {str(e)[:200]}")
+                self.db.add_message(cid, "assistant", f"⚠️ 程序出错: {str(e)[:200]}")
 
     def _do_send_message(self):
         text = self.input_edit.toPlainText().strip()
@@ -740,166 +756,190 @@ class ChatPanel(QWidget):
         self._add_message_bubble("user", text)
         self.input_edit.clear()
         self._responding_convs[conv_id] = True
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("⏳ 思考中...")
+        self._update_send_btn()
         tl = QLabel("🤔 AI 正在分析...")
         tl.setStyleSheet("color: #888; font-size: 13px; padding: 12px;")
         self.empty_label.hide()
         self.messages_layout.addWidget(tl)
         self._scroll_to_bottom()
 
-        from PyQt6.QtWidgets import QApplication
-        QApplication.processEvents()
-
-        # 后台准备文件内容
-        title = text[:30] + ("..." if len(text) > 30 else "")
-        with self.db.session() as s:
-            conv = s.merge(self.current_conversation)
-            if conv.message_count <= 1: conv.title = title
-        messages = self.db.get_messages(conv_id, limit=20)
-        history = [{"role": m.role, "content": m.content} for m in messages]
-        kb_id = self.kb_selector.currentData()
-        folder_id = self.folder_selector.currentData()
-        file_id = self.file_selector.currentData()
-        # 构建选择信息（让 AI 知道用户选了啥）
-        sel_parts = []
-        if kb_id:
-            kb_text = self.kb_selector.currentText()
-            sel_parts.append(f"知识库={kb_text}")
-        if folder_id:
-            sel_parts.append(f"文件夹={self.folder_selector.currentText()}")
-        if file_id:
-            sel_parts.append(f"文件={self.file_selector.currentText()}")
-        selection_info = f"[用户当前选择的资源: {', '.join(sel_parts) if sel_parts else '无'}]"
-        file_context = ""; file_ids = []; file_names = []; image_files = []
-        if kb_id:
-            try:
-                files = []
-                if file_id:
-                    from app.database import File as _File
-                    with self.db.session() as s:
-                        f = s.query(_File).filter(_File.id == file_id).first()
-                        if f: files = [f]
-                elif folder_id:
-                    files = self.db.list_files(folder_id)
-                else:
-                    files = self.db.list_files_by_knowledge_base(kb_id)
-                if files:
-                    file_ids = [f.id for f in files]; file_names = [f.original_name for f in files]
-                    image_files = []
-                    for f in files:
-                        if f.file_type == "img" and f.storage_path and os.path.exists(f.storage_path):
-                            image_files.append({"path": f.storage_path, "detail": "auto"})
-
-                                            # 直接把所有文件内容发给 AI
-                        file_parts = []
-                        for _f in files:
-                            _c = _f.content_text or ""
-                            if _c:
-                                file_parts.append(f"【{_f.original_name}】\n{_c[:5000]}")
-                        if file_parts:
-                            file_context = selection_info + "\n\n[知识库文件内容]\n" + "\n\n".join(file_parts) + f"\n[共 {len(file_ids)} 个文件]"
-            except: pass
-
-        # ── 大屏意图：注入结构化数据预览 + 上一版大屏 spec（供 AI 设计/调整大屏）──
+        # 大屏意图预判（纯文本判断）
         low_text = text.lower()
         is_dash = any(kw in low_text for kw in ("大屏", "看板", "dashboard", "html格式", "html 大屏"))
-        is_adjust = any(kw in text for kw in ("调整", "优化", "修改", "改一下", "换主题", "换图表",
-                                              "加一个", "加个", "布局", "配色", "改成", "重做"))
-        if is_dash:
-            # 0) 强约束：禁止输出 HTML 代码文本、禁止走 generate_chart PNG
-            file_context += ("\n\n[要求] 用户要的是可打开的 HTML 可视化大屏。你【必须】调用"
-                             "[TOOL] generate_dashboard 工具输出 spec(JSON)，由系统渲染成 HTML 文件并给出链接。"
-                             "【绝对禁止】直接输出 HTML 代码文本；【绝对禁止】调用 generate_chart 生成 PNG 图片。"
-                             "只用 generate_dashboard 一个工具。")
-            # 1) 用 pandas 提取当前选中 xlsx/csv 的结构化数据预览，让 AI 第一次就知道数据结构
-            try:
-                from core.dashboard import extract_structured_data, build_data_preview
-                tab_file = next((f for f in files if f.file_type in ("xlsx", "csv")), None) if files else None
-                if tab_file:
-                    sd = extract_structured_data(tab_file.storage_path, tab_file.file_type)
-                    pv = build_data_preview(sd)
-                    if pv:
-                        file_context += f"\n\n[数据预览]\n{pv}"
-            except Exception:
-                pass
-            # 2) 调整意图时，把该会话上一版 spec 注入上下文，让 AI 基于它修改
-            if is_adjust:
-                try:
-                    from app.database import Dashboard as _Dash
-                    with self.db.session() as s:
-                        prev = s.query(_Dash).filter(
-                            _Dash.conversation_id == conv_id
-                        ).order_by(_Dash.version.desc()).first()
-                    if prev:
-                        file_context += (f"\n\n[上一版大屏 spec]\n{prev.spec}"
-                                         f"\n(请基于此修改，输出一份完整的全新 spec)")
-                except Exception:
-                    pass
-
-        if file_context and history:
-            for i in range(len(history)-1, -1, -1):
-                if history[i]["role"] == "user": history[i]["content"] += file_context; break
-        model_key = self.ai_service.classify_task(text)
-        self._ai_conv_id = conv_id  # 向后兼容的 fallback（仅单会话时使用）
+        # 捕获当前选择器状态：UI 状态只能在主线程读；后台线程只认这份快照，
+        # 避免用户切到别的会话改了选择后串线
+        selection = {
+            "kb_id": self.kb_selector.currentData(),
+            "folder_id": self.folder_selector.currentData(),
+            "file_id": self.file_selector.currentData(),
+            "kb_text": self.kb_selector.currentText(),
+            "folder_text": self.folder_selector.currentText(),
+            "file_text": self.file_selector.currentText(),
+        }
         self._conv_state[conv_id] = {
-            "history": history, "model_key": model_key, "label": tl,
-            "file_ids": file_ids, "file_names": file_names,
-            "file_context": file_context, "query": text,
-            "images": image_files, "thread": None, "result": None,
-            "gen_images": [],  # 本会话生成的图片/文件，按会话隔离
+            "query": text, "selection": selection, "label": tl,
+            "history": [], "model_key": "text_analysis",
+            "file_ids": [], "file_names": [], "file_context": "",
+            "images": [], "thread": None, "result": None,
+            "gen_images": [],   # 本会话生成的图片/文件，按会话隔离
             "dash_request": is_dash,  # 本次是否为可视化大屏请求
-            "stream_text": "",        # 流式输出的累积文本（供 UI 实时刷新）
+            "stream_text": "",  # 流式输出的累积文本（供 UI 实时刷新）
         }
         # 用闭包绑定会话ID，避免多会话并发时共享的 _ai_conv_id 被后发会话覆盖
         QTimer.singleShot(1, lambda cid=conv_id: self._execute_ai_call(cid))
 
     def _execute_ai_call(self, conv_id=None):
+        """启动后台线程完成 AI 调用。
+        文件内容收集、数据预览（pandas）、AI 请求全部在后台线程执行——
+        这些操作在大文件时要几秒到几十秒，放主线程会冻结界面，
+        导致其他会话无法同时发消息。"""
         import threading as _th
         try:
             if not conv_id:
                 conv_id = getattr(self, '_ai_conv_id', None)
-            state = self._conv_state.get(conv_id, {}) if conv_id else {}
-            if not state:
-                state = {"conv_id": conv_id, "query": (getattr(self, "_ai_user_query", "") or ""),
-                    "file_ids": (getattr(self, "_ai_file_ids", []) or []),
-                    "history": (getattr(self, "_ai_history", []) or []),
-                    "model_key": (getattr(self, "_ai_model_key", "text_analysis") or "text_analysis"),
-                    "images": (getattr(self, "_ai_images", []) or [])}
-            query = state.get("query","") or ""; file_ids = state.get("file_ids",[]) or []
-            history = state.get("history",[]) or []; model_key = state.get("model_key","text_analysis") or "text_analysis"
-            images = state.get("images",[]) or []
-            if file_ids and query:
-                cached = self.db.get_cached_result(file_ids, query)
-                if cached:
-                    self.db.add_log("INFO","chat","cache_hit","缓存命中")
-                    self._finish_ai_response(cached,conv_id); return
-            cm = list(history)
-            def worker(cid,st):
+            if not conv_id or conv_id not in self._conv_state:
+                return
+
+            def worker(cid):
+                st = self._conv_state.get(cid, {})
+                if not st:
+                    return  # 会话已被删除，丢弃本次任务
                 try:
+                    query = st.get("query", "")
+                    sel = st.get("selection", {}) or {}
+
+                    # 会话标题（首条消息时用问题命名）
+                    title = query[:30] + ("..." if len(query) > 30 else "")
+                    from app.database import Conversation as _Conv
+                    with self.db.session() as s:
+                        conv = s.query(_Conv).filter(_Conv.id == cid).first()
+                        if conv and (conv.message_count or 0) <= 1:
+                            conv.title = title
+
+                    # 历史消息（最近 20 条）
+                    messages = self.db.get_messages(cid, limit=20)
+                    history = [{"role": m.role, "content": m.content} for m in messages]
+
+                    # 收集选中的知识库文件（只认发送时的快照）
+                    kb_id = sel.get("kb_id"); folder_id = sel.get("folder_id"); file_id = sel.get("file_id")
+                    file_ids = []; file_names = []; image_files = []; files = []
+                    if kb_id:
+                        try:
+                            if file_id:
+                                from app.database import File as _File
+                                with self.db.session() as s:
+                                    f = s.query(_File).filter(_File.id == file_id).first()
+                                    if f: files = [f]
+                            elif folder_id:
+                                files = self.db.list_files(folder_id)
+                            else:
+                                files = self.db.list_files_by_knowledge_base(kb_id)
+                            if files:
+                                file_ids = [f.id for f in files]
+                                file_names = [f.original_name for f in files]
+                                for f in files:
+                                    if f.file_type == "img" and f.storage_path and os.path.exists(f.storage_path):
+                                        image_files.append({"path": f.storage_path, "detail": "auto"})
+                                # 直接把所有文件内容发给 AI
+                                file_parts = []
+                                for _f in files:
+                                    _c = _f.content_text or ""
+                                    if _c:
+                                        file_parts.append(f"【{_f.original_name}】\n{_c[:5000]}")
+                                if file_parts:
+                                    sel_parts = []
+                                    if kb_id: sel_parts.append(f"知识库={sel.get('kb_text')}")
+                                    if folder_id: sel_parts.append(f"文件夹={sel.get('folder_text')}")
+                                    if file_id: sel_parts.append(f"文件={sel.get('file_text')}")
+                                    selection_info = f"[用户当前选择的资源: {', '.join(sel_parts) if sel_parts else '无'}]"
+                                    st["file_context"] = (selection_info + "\n\n[知识库文件内容]\n"
+                                        + "\n\n".join(file_parts) + f"\n[共 {len(file_ids)} 个文件]")
+                        except Exception:
+                            pass
+                    st["file_ids"] = file_ids
+                    st["file_names"] = file_names
+                    st["images"] = image_files
+
+                    # ── 大屏意图：注入结构化数据预览 + 上一版大屏 spec（供 AI 设计/调整大屏）──
+                    file_context = st.get("file_context", "")
+                    if st.get("dash_request"):
+                        # 0) 强约束：禁止输出 HTML 代码文本、禁止走 generate_chart PNG
+                        file_context += ("\n\n[要求] 用户要的是可打开的 HTML 可视化大屏。你【必须】调用"
+                                         "[TOOL] generate_dashboard 工具输出 spec(JSON)，由系统渲染成 HTML 文件并给出链接。"
+                                         "【绝对禁止】直接输出 HTML 代码文本；【绝对禁止】调用 generate_chart 生成 PNG 图片。"
+                                         "只用 generate_dashboard 一个工具。")
+                        # 1) 用 pandas 提取当前选中 xlsx/csv 的结构化数据预览，让 AI 第一次就知道数据结构
+                        try:
+                            from core.dashboard import extract_structured_data, build_data_preview
+                            tab_file = next((f for f in files if f.file_type in ("xlsx", "csv")), None)
+                            if tab_file:
+                                sd = extract_structured_data(tab_file.storage_path, tab_file.file_type)
+                                pv = build_data_preview(sd)
+                                if pv:
+                                    file_context += f"\n\n[数据预览]\n{pv}"
+                        except Exception:
+                            pass
+                        # 2) 调整意图时，把该会话上一版 spec 注入上下文，让 AI 基于它修改
+                        is_adjust = any(kw in query for kw in ("调整", "优化", "修改", "改一下", "换主题",
+                                                               "换图表", "加一个", "加个", "布局", "配色",
+                                                               "改成", "重做"))
+                        if is_adjust:
+                            try:
+                                from app.database import Dashboard as _Dash
+                                with self.db.session() as s:
+                                    prev = s.query(_Dash).filter(
+                                        _Dash.conversation_id == cid
+                                    ).order_by(_Dash.version.desc()).first()
+                                if prev:
+                                    file_context += (f"\n\n[上一版大屏 spec]\n{prev.spec}"
+                                                     f"\n(请基于此修改，输出一份完整的全新 spec)")
+                            except Exception:
+                                pass
+                        st["file_context"] = file_context
+
+                    # 文件上下文注入到本次提问
+                    if file_context and history:
+                        for i in range(len(history)-1, -1, -1):
+                            if history[i]["role"] == "user":
+                                history[i]["content"] += file_context; break
+                    st["history"] = history
+
+                    # 模型选择
+                    model_key = self.ai_service.classify_task(query)
+                    st["model_key"] = model_key
+
+                    # 缓存命中：直接用之前的结果（跳过工具处理和重复缓存）
+                    if file_ids and query:
+                        cached = self.db.get_cached_result(file_ids, query)
+                        if cached:
+                            self.db.add_log("INFO", "chat", "cache_hit", "缓存命中")
+                            st["cache_hit"] = True
+                            st["result"] = cached
+                            return
+
                     # 流式回调：把增量累积到会话状态，主线程 QTimer 轮询刷新 UI
                     def on_delta(delta):
-                        if cid in self._conv_state:
-                            self._conv_state[cid]["stream_text"] = \
-                                self._conv_state[cid].get("stream_text", "") + delta
-                    r = self.ai_service.chat(messages=cm, model_key=model_key, images=images,
-                                              stream_callback=on_delta)
-                    if cid in self._conv_state: self._conv_state[cid]["result"] = r or "(空)"
+                        cst = self._conv_state.get(cid)
+                        if cst is not None:
+                            cst["stream_text"] = cst.get("stream_text", "") + delta
+                    r = self.ai_service.chat(messages=history, model_key=model_key,
+                                             images=image_files, stream_callback=on_delta)
+                    st["result"] = r or "(空)"
                 except Exception as e:
                     import traceback
                     self.db.add_log("ERROR", "chat", "ai_call_fail",
-                                    f"AI调用失败 [{model_key}]: {str(e)[:100]}",
+                                    f"AI调用失败: {str(e)[:100]}",
                                     {"trace": traceback.format_exc()[:200]})
-                    if cid in self._conv_state:
-                        self._conv_state[cid]["result"] = f"⚠️ 错误: {str(e)[:200]}"
-            t = _th.Thread(target=worker, args=(conv_id,state), daemon=True)
-            if conv_id and conv_id in self._conv_state:
+                    st["result"] = f"⚠️ 错误: {str(e)[:200]}"
+
+            t = _th.Thread(target=worker, args=(conv_id,), daemon=True)
+            if conv_id in self._conv_state:
                 self._conv_state[conv_id]["thread"] = t
                 self._conv_state[conv_id]["start_time"] = time.time()
             t.start()
             self._poll_ai_result(conv_id)
         except Exception as e:
-            self.db.add_log("ERROR","chat","execute",f"AI异常: {str(e)[:100]}")
+            self.db.add_log("ERROR", "chat", "execute", f"AI异常: {str(e)[:100]}")
             self._finish_ai_response(f"⚠️ 错误: {str(e)[:200]}", conv_id)
 
     def _poll_ai_result(self, conv_id):
@@ -915,14 +955,15 @@ class ChatPanel(QWidget):
             self.db.add_log("DEBUG","chat","execute",f"AI返回 ({len(result)}字)",duration_ms=elapsed)
             # 新一轮（AI 修正后的）回复已就绪，清除上轮的 continue_requested 守卫
             st.pop("continue_requested", None)
-            # 执行工具命令
-            result = self._process_tool_commands(result, conv_id)
+            # 执行工具命令（缓存命中的是已处理过的最终文本，跳过）
+            if not st.get("cache_hit"):
+                result = self._process_tool_commands(result, conv_id)
             # 若工具触发了继续推理（如大屏 spec 修正），本帧不结束，等待 AI 新一轮
             st = self._conv_state.get(conv_id, {}) or {}
             if st.get("continue_requested"):
                 return
             file_ids = st.get("file_ids",[]) or []; query = st.get("query","") or ""
-            if file_ids and query:
+            if file_ids and query and not st.get("cache_hit"):
                 try: self.db.save_cached_result(file_ids,query,result)
                 except: pass
             self._finish_ai_response(result, conv_id)
@@ -942,8 +983,12 @@ class ChatPanel(QWidget):
             text = st.get("stream_text", "")
             if lbl is None or not text:
                 return
+            # 气泡可能已随会话切换被销毁（_load_messages 重建消息区），此时不刷新；
+            # 切回该会话时 _load_messages 会重建气泡并接上进度
+            from PyQt6 import sip
+            if sip.isDeleted(lbl):
+                return
             from PyQt6.QtCore import Qt as _Qt
-            from PyQt6.QtWidgets import QLabel as _QL
             lbl.setTextFormat(_Qt.TextFormat.RichText)
             lbl.setText(_md_to_html(text))
             self._scroll_to_bottom()
@@ -1458,12 +1503,22 @@ class ChatPanel(QWidget):
             else:
                 lbl = getattr(self, '_ai_label', None)
             if lbl:
-                try: lbl.deleteLater()
-                except: pass
+                try:
+                    from PyQt6 import sip
+                    if not sip.isDeleted(lbl):
+                        lbl.deleteLater()
+                except Exception:
+                    pass
             # 确定 conv_id
             if not conv_id:
                 conv_id = getattr(self, '_ai_conv_id', None)
             if not conv_id:
+                return
+            # 会话已被删除（删除时后台还在生成）→ 丢弃回复，
+            # 否则消息会写进不存在的会话，被下个复用同 id 的会话"继承"
+            if not self.db.get_conversation(conv_id):
+                self._responding_convs.pop(conv_id, None)
+                self._conv_state.pop(conv_id, None)
                 return
             # 取出会话状态（在 pop 之前保留引用，供后续读取）
             st = self._conv_state.get(conv_id, {}) or {}

@@ -108,6 +108,19 @@ class KnowledgePanel(QWidget):
     def _auto_import_file(self, fp):
         """自动导入上传文件夹中的新文件"""
         try:
+            # 查重：该路径已有未删除的登记记录就跳过。
+            # 否则手动上传复制到 uploads 的瞬间会被文件夹监听器当成
+            # "新文件"再导入一次，同一文件在库里出现两条记录
+            # （已软删的记录不拦：用户删过又重新上传时应允许重新导入）
+            from app.database import File as _FileModel
+            with self.db.session() as s:
+                dup = s.query(_FileModel).filter(
+                    _FileModel.storage_path == fp,
+                    _FileModel.is_deleted == False
+                ).first()
+            if dup:
+                return
+
             name = os.path.basename(fp)
             # 从路径中提取知识库和文件夹信息
             rel_path = os.path.relpath(fp, self.config.upload_dir)
@@ -453,6 +466,21 @@ class KnowledgePanel(QWidget):
             os.makedirs(sub_dir, exist_ok=True)
             dest_name = f"{md5_hash[:8]}_{file_name}"
             dest_path = os.path.join(sub_dir, dest_name)
+            # 预先登记到监听器的已知文件集合，防止复制动作触发
+            # 文件夹监听器把本次上传误判为"新文件"再自动导入一遍（重复记录）
+            try:
+                self._known_files.add(dest_path)
+            except Exception:
+                pass
+            # 同一文件（MD5 相同）之前已导入过且未被删除就不再重复导入
+            from app.database import File as _FileModel
+            with self.db.session() as s:
+                dup = s.query(_FileModel).filter(
+                    _FileModel.storage_path == dest_path,
+                    _FileModel.is_deleted == False
+                ).first()
+            if dup:
+                return
             shutil.copy2(file_path, dest_path)
 
             # 写入数据库
@@ -505,11 +533,6 @@ class KnowledgePanel(QWidget):
 
         except Exception as e:
             QMessageBox.warning(self, "导入失败", f"文件 {os.path.basename(file_path)} 导入失败:\n{str(e)}")
-            self.db.add_log("ERROR", "file", "upload_failed",
-                            f"文件导入失败: {file_path}", {"error": str(e)})
-
-        except Exception as e:
-            QMessageBox.warning(self, "导入失败", f"文件 {file_path} 导入失败:\n{str(e)}")
             self.db.add_log("ERROR", "file", "upload_failed",
                             f"文件导入失败: {file_path}", {"error": str(e)})
 
@@ -608,7 +631,9 @@ class KnowledgePanel(QWidget):
         try:
             reply = QMessageBox.question(
                 self, "确认删除",
-                "确定要删除此知识库吗？\n所有文件和文件夹将移入回收站。",
+                "确定要删除此知识库吗？\n"
+                "所有文件和文件夹将移入回收站（可恢复解析后的文本），\n"
+                "对应的磁盘文件将同步删除。",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
